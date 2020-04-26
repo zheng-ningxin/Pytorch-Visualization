@@ -30,17 +30,18 @@ class Pytorch_Visual:
         # The functions need to be hooked to build up the graph
         # Variable use the same add operation of Tensor (torch.Tensor.__add__)
         self.func_need_hook = []
-        torch_keys = ['flatten', 'squeeze', 'unsqueeze']
+        torch_keys = ['flatten', 'squeeze', 'unsqueeze', 'cat']
         for attr in torch_keys:
             self.func_need_hook.append((torch, attr))
-        tensor_keys = ['view', '__add__', '__iadd__', 'flatten', 'squeeze', 'unsqueeze']
+        tensor_keys = [ 'view', '__add__', '__iadd__', 'flatten',
+                        'squeeze', 'unsqueeze', 'permute', 'contiguous']
         #tensor_keys = ['view', '__add__']
         for attr in tensor_keys:
             self.func_need_hook.append((torch.Tensor, attr))
         # elu is for the activations such as, relu, celu
         # pool is for the pooling layers, such as avg_pool2d 
         functional_keys = [ 'pool', 'batch_norm', 'dropout', 'elu', 
-                            'softmax', 'tanh' 'sigmoid']
+                            'softmax', 'tanh' 'sigmoid', 'interpolate']
         for attr, func in torch.nn.functional.__dict__.items():
             for name_key in functional_keys:
                 # filter out the target functional module that need to be hooked
@@ -51,20 +52,23 @@ class Pytorch_Visual:
         self.visted = set()
         # Init the hook functions
         self.deploy_hooks()
-        out = self.model(data)
+        self.out = self.model(data)
         # Clear the hook functions
         self.remove_hooks()
 
     @property
     def hooks_length(self):
         return len(self.hooks)
-
+    
     def op_decorator(self, func, name):
         def new_func(*args, **kwargs):
+
             inputs = []
-            for input in args:
-                if isinstance(input, Tensor) or isinstance(input, Variable):
-                    inputs.append(input)
+            if len(args) > 0:
+                inputs.extend(self.get_tensors_from(args))
+            if len(kwargs) > 0:
+                inputs.extend(self.get_tensors_from(kwargs))
+            
             out = func(*args, **kwargs)
             # build the graph
             iids = [id(input) for input in inputs]
@@ -90,29 +94,78 @@ class Pytorch_Visual:
                     out.graph_info['from'] = [name]
             else:
                 out.graph_info = {'from' : [name]}
+
             return out
         return new_func
 
+
+    def get_tensors_from(self, args):
+        """
+        Some layers/modules may return servaral tensors as output
+        (IntermediateLayerGetter) or take multiple tensors as 
+        input(torch.cat). Therefore, We need find the real output/input 
+        tensor out and build the network architecture based on them.
+        Note: 
+            I find that the input format of torch.cat is the tuple of tuple
+            which looks like ((t1, t2)), so, we use recursive func to
+            find all tensors
+        """
+        tensors = []
+        if isinstance(args, dict):
+            # some layers may return their output as a dict 
+            # ex. the IntermediateLayerGetter in the face detection jobs.
+            for key, val in args.items():
+                if isinstance(val, torch.Tensor):
+                    tensors.append(val)
+                else:
+                    tensors.extend(self.get_tensors_from(val))
+        elif isinstance(args, list) or isinstance(args, tuple):
+            # list or tuple
+            for item in args:
+                if isinstance(item, torch.Tensor):
+                    tensors.append(item)
+                else:
+                    tensors.extend(self.get_tensors_from(item))
+        elif isinstance(args, torch.Tensor) or isinstance(args, torch.autograd.Variable):
+            # if the output is a already a tensor/variable, then return itself
+            tensors.append(args)
+        return tensors
+
+    
     def get_forward_hook(self):
         def forward_hook(module, inputs, output):
+
             checker = module.pruneratio_checker
             linputs = list(inputs)
             # Filter the Tensor or Variable inputs out
             linputs = list(filter(lambda x: isinstance(x, Tensor) or isinstance(x, Variable), linputs))
             iids = [id(input) for input in linputs]
-            oid = id(output)
+            t_outputs = self.get_tensors_from(output)
+            oids = [id(t) for t in t_outputs]
             mid = id(module)
+
             # For the modules that have multiple submodules, for example(Sequential)
             # They will return at here, because the output tensor is already added 
             # by their submodules. Therefore, we only record the lowest level connection.
-            if oid in checker.tensors:
-                return 
-
+            flag = False
+            for oid in oids:
+                if oid not in checker.tensors:
+                    flag = True
+                    break 
+            if not flag:
+                # if all output tensors are already created, in this case, the module
+                # is a father-module, and we only draw the lowest-level network architecture
+                return
+            # involve the output tensors into the graph
             self.layers.add(mid)
             self.id2obj[mid] = module
-            
-            checker.tensors.add(oid)
-            checker.id2obj[oid] = output
+            for tid, _out in enumerate(t_outputs):
+                if oids[tid] not in checker.tensors:
+                    checker.tensors.add(oids[tid])
+                    checker.id2obj[oids[tid]] = _out
+                    _out.graph_info = {'from' : [module.module_name]}
+            self.forward_edge[mid] = oids
+
             for i in range(len(iids)):
                 if iids[i] not in checker.tensors:
                     checker.tensors.add(iids[i])
@@ -122,11 +175,9 @@ class Pytorch_Visual:
                 elif mid not in checker.forward_edge[iids[i]]:
                     checker.forward_edge[iids[i]].append(mid)
             # We need to track the input and output tensors from the model perspective
-            self.forward_edge[mid] = [oid]
-            module.input_tensors = iids
-            module.output_tensor = oid
-            output.graph_info = {'from' : [module.module_name]}
-            
+            module.input_tensors = linputs
+            module.output_tensor = t_outputs
+
         return forward_hook
 
 
@@ -169,7 +220,6 @@ class Pytorch_Visual:
             # Only the tensors can be visited twice, the conv layers
             # won't be access twice in the DFS progress
             # check if the dimmension is ok
-            
             if self.id2obj[curid].prune['channel'] != channel:
                 return False
             return True
@@ -259,12 +309,27 @@ class Pytorch_Visual:
                 self.visual_traverse(next_, graph, curid)
         
 
-    def visualization(self, filename='network', format='jpg'):
+    def visualization(self, filename='network', format='jpg', debug=False):
+        """
+        visualize the network architecture automaticlly.
+        Input:
+            filename: the filename of the saved image file
+            format: the output format
+            debug: if enable the debug mode
+        """
         import graphviz
         graph = graphviz.Digraph(format=format)
         self.visted.clear()
         graph_start = id(self.data)
         self.visual_traverse(graph_start, graph, None)
+        if debug:
+            # If enable debug, draw all available tensors in the same
+            # graph. It the network's architecture are seperated into
+            # two parts, we can easily and quickly find where the graph
+            # is broken, and find the missing hook point. 
+            for tid in self.tensors:
+                if tid not in self.visted:
+                    self.visual_traverse(tid, graph, None)
         graph.render(filename)
             
 
