@@ -30,7 +30,10 @@ class Pytorch_Visual:
         # The functions need to be hooked to build up the graph
         # Variable use the same add operation of Tensor (torch.Tensor.__add__)
         self.func_need_hook = []
-        tensor_keys = ['view', '__add__', '__iadd__']
+        torch_keys = ['flatten', 'squeeze', 'unsqueeze']
+        for attr in torch_keys:
+            self.func_need_hook.append((torch, attr))
+        tensor_keys = ['view', '__add__', '__iadd__', 'flatten', 'squeeze', 'unsqueeze']
         #tensor_keys = ['view', '__add__']
         for attr in tensor_keys:
             self.func_need_hook.append((torch.Tensor, attr))
@@ -122,7 +125,7 @@ class Pytorch_Visual:
             self.forward_edge[mid] = [oid]
             module.input_tensors = iids
             module.output_tensor = oid
-            output.gragh_info = {'from' : [module.module_name]}
+            output.graph_info = {'from' : [module.module_name]}
             
         return forward_hook
 
