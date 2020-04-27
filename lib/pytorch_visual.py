@@ -33,7 +33,7 @@ class Pytorch_Visual:
         torch_keys = ['flatten', 'squeeze', 'unsqueeze', 'cat']
         for attr in torch_keys:
             self.func_need_hook.append((torch, attr))
-        tensor_keys = [ 'view', '__add__', '__iadd__', 'flatten',
+        tensor_keys = [ 'view', '__add__', '__iadd__', 'flatten', 'mean', 'reshape',
                         'squeeze', 'unsqueeze', 'permute', 'contiguous']
         #tensor_keys = ['view', '__add__']
         for attr in tensor_keys:
